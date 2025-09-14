@@ -4,107 +4,121 @@ using LinearAlgebra
 using Random
 
 # 1. Material parameters
-E = 210e3 # MPa
-ν = 0.3
-G = E/(2*(1+ν)) # Shear Modulus
-K = E/(3*(1-2*ν)) # Bulk Modulus
-Y0 = 350.0 # MPa Initial stress of the material Y0 comes from a tensile test or compression test.
-t_star = 1.0 # s
-n_exp = 2
-NN0 = 1.0 # scaling for NN outputs
+E = 210e3 # MPa Young’s modulus
+ν = 0.3 # Poisson’s ratio
+G =  Float32(E/(2*(1+ν))) # Shear Modulus
+K = Float32(E/(3*(1-2*ν))) # Bulk Modulus
+Y0 = Float32(350.0) # MPa Initial stress of the material Y0 comes from a tensile test or compression test.
+t_star = Float32(1.0) # _star and n_exp Parameters for viscoplastic flow (flow rate exponent and characteristic time).
+n_exp = 1
+NN0 = Float32(1.0) # Scaling factor for neural network outputs.
 
 println("Material parameters: G=$G, K=$K, Y0=$Y0")
 
 # 2. Material state
-mutable struct MaterialState
-    εp::Matrix{Float64} # 3x3 plastic strain
-    β::Matrix{Float64} # 3x3 backstress
-    κ::Float64 # isotropic hardening
+mutable struct MaterialState{T<:AbstractFloat}
+    εp::Matrix{T}  # plastic strain
+    β::Matrix{T}   # backstress
+    κ::T           # isotropic hardening
 end
+
 #Stores internal variables that evolve over time: plastic strain, backstress, and isotropic hardening(represents the uniform expansion of the yield surface in stress space).
 
-function MaterialStateZero()
+function MaterialStateZero(::Type{T}=Float32) where T<:AbstractFloat
     #At the very beginning of a simulation, before any load is applied, the material is assumed undeformed and unstressed.
     #Plastic strain εp = 0 → material has not plastically deformed yet.
     #Backstress β = 0 → no internal stress has accumulated.
     #Isotropic hardening κ = 0 → no hardening has occurred.
-    MaterialState(zeros(3,3), zeros(3,3), 0.0)
+    MaterialState{T}(zeros(T,3,3), zeros(T,3,3), zero(T))
 end
 
 # 3. Helper functions
-double_dot(A::Matrix{Float64}, B::Matrix{Float64}) = sum(A .* B)
+function double_dot(A::AbstractMatrix{<:AbstractFloat}, B::AbstractMatrix{<:AbstractFloat})
+    return Float32(sum(Float32.(A) .* Float32.(B)))
+end
+
 #.* is element-wise multiplication in Julia.
 #Adds all the numbers in the resulting matrix.
 #double contraction in tensor #https://github.com/KeitaNakamura/Tensorial.jl ⊡₂
 
-function deviatoric(T::Matrix{Float64})
-    return T .- (tr(T)/3.0) * Matrix{Float64}(I, 3, 3)
+function deviatoric(T_::AbstractMatrix{T}) where T<:AbstractFloat
+    return T_ .- (tr(T_)/3.0) * Matrix{T}(I(3))
 end
 #remove the mean/volumetric part of a tensor → leave only shear/deviatoric part.
 #Essential for plasticity models because plastic deformation depends on deviatoric stress, not hydrostatic pressure.
 
-function yield_vonMises(σ::Matrix{Float64}, β::Matrix{Float64}, κ::Float64, Y0::Float64)
-    #Von Mises yield function with kinematic (β) and isotropic (κ) hardening:
-    #Φ = sqrt( (3/2 )* dev((σ - β) : dev(σ - β))) - [Y0 + κ]
-    #Returns > 0 if yielding occurs, ≤ 0 if elastic.
-    s=σ - β
+function yield_vonMises(σ::AbstractMatrix{T}, β::AbstractMatrix{T}, κ::T, Y0::T) where T<:AbstractFloat
+    # Von Mises yield function with kinematic (β) and isotropic (κ) hardening
+    # Returns >0 if yielding occurs, ≤0 if elastic
+    σf = Float32.(σ)
+    βf = Float32.(β)
+
+    s = σf .- βf
     s_dev = deviatoric(s)
-    Φ = sqrt((3/2) * double_dot(s, s_dev)) - (Y0 + κ)
-    return Φ
+    σ_eq = sqrt(Float32(3/2) * double_dot(s_dev, s_dev))
+    return σ_eq - (Y0 + κ)
 end
 
-function flow_direction(σ::Matrix{Float64}, β::Matrix{Float64})
+function flow_direction(σ::AbstractMatrix{T}, β::AbstractMatrix{T}) where T<:AbstractFloat
     #ν = (3/2)*((dev(σ) - dev(β)) / f_vM (σ-β))
     #ν=(∂σ/∂Φ)​ = plastic flow direction (normal to yield surface, associative plasticity).
-    s=σ - β
-    s_dev=deviatoric(s)
-    σ_dev=deviatoric(σ)
-    β_dev=deviatoric(β)
+    σf = Float32.(σ)
+    βf = Float32.(β)
+    s = σf .- βf
+    s_dev = deviatoric(s)
+    σ_dev = deviatoric(σf)
+    β_dev = deviatoric(βf)
     f_vM = sqrt((3/2) * double_dot(s, s_dev))
-    ν = (3/2) * ((σ_dev-β_dev)/f_vM)
-    return ν
+    if f_vM < 1e-14
+        return zeros(3,3)  # avoid division by zero
+    else
+        ν = (3/2) * ((σ_dev-β_dev)/f_vM)
+        return ν
+    end
 end
 
-function compute_invariants(state::MaterialState, ν::Matrix{Float64}, NN0::Float64)
-    
-    # Extract current material state variables
-    β = state.β      # backstress tensor (3x3)
-    εp = state.εp    # plastic strain tensor (3x3)
+function compute_invariants(state::MaterialState{T}, ν::AbstractMatrix{T}, NN0::T) where T<:AbstractFloat
+    # Ensure all state variables are of type T
+    β = state.β      # backstress tensor
+    εp = state.εp    # plastic strain tensor
     κ = state.κ      # isotropic hardening (scalar)
 
     # ----------------------------
-    # 1. Invariants as per Eq. (28)
+    # Compute invariants
     # ----------------------------
-    # I1 = κ (isotropic hardening), scaled by NN0
     I1 = κ / NN0
-    # I2 = β : β (magnitude of backstress), scaled by NN0^2
-    I2 = double_dot(β, β) / NN0^2
-    # I3 = ν : β (interaction between flow direction and backstress), scaled by NN0
+    I2 = double_dot(β, β) / (NN0^2)
     I3 = double_dot(ν, β) / NN0
-    # I4 = β : εp (interaction between backstress and plastic strain), scaled by NN0^2
-    I4 = double_dot(β, εp) / NN0^2
-    # I5 = ν : εp (interaction between flow direction and plastic strain), scaled by NN0
+    I4 = double_dot(β, εp) / (NN0^2)
     I5 = double_dot(ν, εp) / NN0
-    # I6 = εp : εp (magnitude of plastic strain), scaled by NN0^2
-    I6 = double_dot(εp, εp) / NN0^2
-    return [I1, I2, I3, I4, I5, I6]
+    I6 = double_dot(εp, εp) / (NN0^2)
+
+    return T[I1, I2, I3, I4, I5, I6]  # return as vector of type T
 end
 
 
-function evolution_laws(state::MaterialState, ν::Matrix{Float64}, λdot::Float64, NN_output::Vector{Float64}, NN0::Float64)
+
+function evolution_laws(state::MaterialState, ν::Matrix{Float32}, λdot::Float32, NN_output::Vector{Float32}, NN0::Float32)
     #Proposed evolution laws using NN outputs:
     #b˙=−λ˙[(1−(ν:β) NNk,ν)ν−NNk,ββ]
     #κ˙=−λ˙[1−κ NN iso]
-    NN_iso, NN_kβ, NN_kν = NN_output[1:3] ./ NN0
-    tr_dot = double_dot(ν, state.β)
-    β_dot = -λdot * ((1 - tr_dot * NN_kν) * ν - NN_kβ * state.β)
-    κ_dot = λdot * (1 + NN_iso)  # isotropic hardening
+    # Neural net outputs
+    NN_iso, NN_kβ, NN_kν = NN_output[1:3]
+
+    # Flow interaction
+    tr_dot = double_dot(ν, state.β) / NN0   # <-- scale β consistently
+
+    # Backstress evolution (scaled)
+    β_dot = -λdot * (((1 - tr_dot * NN_kν) * ν) - (NN_kβ * state.β / NN0))
+
+    # Isotropic hardening (scaled)
+    κ_dot = λdot * (1 + NN_iso) * NN0
     return β_dot, κ_dot
 end
 
 # 4. Elastic stress 
 
-function elastic_stress(ε::Matrix{Float64}, state::MaterialState, G::Float64, K::Float64)
+function elastic_stress(ε::AbstractMatrix{T}, state::MaterialState{T}, G::T, K::T) where T<:AbstractFloat
     # Elastic stiffness tensor (E):
     # relates stress and strain via:
     #     σ = C : ε
@@ -129,8 +143,8 @@ function elastic_stress(ε::Matrix{Float64}, state::MaterialState, G::Float64, K
     #     Ψ_e = 1/2 * (ε - ε_p) : C : (ε - ε_p)
     # with respect to ε, where ε_p is the plastic strain.
 
-    εe = ε - state.εp
-    return 2*G*deviatoric(εe) + K*tr(εe)*Matrix{Float64}(I,3,3)
+    εe = ε .- state.εp
+    return 2*G*deviatoric(εe) + K*tr(εe)*Matrix{T}(I(3))
 end
 
 # 5. Time integration (3D)
@@ -153,102 +167,160 @@ function integrate_material_3D(nn, ε_hist_3D, dt, G, K, Y0, n, t_star, NN0)
     σ_hist = [zeros(3,3) for i in 1:nt] #empty array to store the stress at each time step.
 
     for i in 1:nt
+        println("\n===============================")
+        println("🔹 Time step: $i / $nt")
+        println("===============================")
+
+        # --- Strain history ---
         ε = ε_hist_3D[i]
-        #At each step, take the current strain matrix.
-        σ = elastic_stress(ε, state, G, K)
-        #Compute the elastic stress assuming the current plastic starting
-        ν = flow_direction(σ, state.β)
-        #Calculates the direction of plastic flow based on deviatoric stress minus backstress
+        println("ε (strain tensor):\n$ε")
+
+        # --- Elastic predictor ---
+        σ = Float32.(elastic_stress(ε, state, G, K))
+        println("σ (elastic stress tensor):\n$σ")
+
+        # --- Flow direction ---
+        ν = Float32.(flow_direction(σ, state.β))
+        println("ν (flow direction):\n$ν")
+
+        # --- Invariants for NN input ---
         invariants = compute_invariants(state, ν, NN0)
-        #Extract 6 scalar quantities from the current state (plastic strain, backstress, etc.) for the neural network.
-        NN_output = Float64.(vec(nn(reshape(Float64.(invariants), :, 1))))
+        println("Invariants (NN input): ", invariants)
+
+        # --- Neural network output ---
+        NN_input = reshape(Float32.(invariants), :, 1)
+        NN_output = Float32.(vec(nn(Float32.(NN_input))))
+        println("NN input (reshaped): ", NN_input)
+        println("NN output: ", NN_output)
+
+        # --- Yield function ---
         Φ = yield_vonMises(σ, state.β, state.κ, Y0)
+        println("Yield function Φ: ", Φ)
+
+        # --- Plastic multiplier ---
         λdot = max(0, (Φ / Y0)^n / t_star)
+        println("λ̇ (plastic multiplier rate): ", λdot)
+
+        # --- Evolution laws ---
         β_dot, κ_dot = evolution_laws(state, ν, λdot, NN_output, NN0)
+        println("β̇ (backstress rate):\n$β_dot")
+        println("κ̇ (hardening variable rate): ", κ_dot)
+
+        # --- State updates ---
         state.β .+= β_dot .* dt
-        state.κ += κ_dot * dt
+        state.κ  += κ_dot * dt
         state.εp .+= λdot .* ν .* dt
+        println("Updated backstress β:\n", state.β)
+        println("Updated κ: ", state.κ)
+        println("Updated plastic strain εp:\n", state.εp)
+
+        # --- Store history ---
         σ_hist[i] .= σ
-        #Store the current stress tensor in the history array.
+        println("Stored σ_hist[$i]:\n", σ_hist[i])
     end
 
     return σ_hist
+
 end
 
 
 # 6. Neural Network (3D invariants → evolution)
-
-function dense64(in_dim, out_dim, σ)
-    W = randn(Float64, out_dim, in_dim)
-    b = zeros(Float64, out_dim)
-    Dense(W, b, σ)
-end
-
 nn = Chain(
-    dense64(6,6,tanh),
-    dense64(6,6,tanh),
-    dense64(6,6,tanh),
-    dense64(6,6,tanh),
-    dense64(6,5,tanh),
-    dense64(5,3,x->x.^2)
+    Dense(6,6,tanh),
+    Dense(6,6,tanh),
+    Dense(6,6,tanh),
+    Dense(6,6,tanh),
+    Dense(6,5,tanh),
+    Dense(5,3,x->x.^2) #One Dense(5 → 3, x -> x.^2) → output layer with 3 neurons, using squared activation
 )
+# W = weight matrix, shape (out_dim, in_dim), initialized with standard normal values.
+# b = bias vector of length out_dim, initialized to zeros.
+# Returns a Dense layer (from Flux.jl) with these weights, biases, and the specified activation.
 
 dup_nn = Enzyme.Duplicated(nn)
 
 # 7. Loss function (3D)
 
 # σ = [σxx σyx σzx; σxy σyy σzy; σxz σyz σzz]
-function loss(σ_sim::Vector{Matrix{Float64}}, σ_exp::Vector{Matrix{Float64}}; w_g::Float64=1.0, delta_l::Int=10)
-    #we found that a weighting factor 𝑤g = 1 worked well with using data ten points apart to calculate the numerical gradient.
+function loss_exact_paper(σ_sim::Vector{<:AbstractMatrix{<:AbstractFloat}}, 
+                          σ_exp::Vector{<:AbstractMatrix{<:AbstractFloat}};
+                          w_g::Float32=Float32(1.0), delta_l::Int=10)
+    Nstp = length(σ_sim)
+    ncomp = size(σ_sim[1], 1)
 
-    Nstp = length(σ_sim)           # number of timesteps
-    loss_L2 = 0.0                  # first term: normalized L2 loss
-    loss_sobolev = 0.0             # second term: derivative/regularization term
+    # Compute global stress range
+    smin = minimum([σ_exp[l][a,b] for l in 1:Nstp, a in 1:ncomp, b in 1:ncomp])
+    smax = maximum([σ_exp[l][a,b] for l in 1:Nstp, a in 1:ncomp, b in 1:ncomp])
+    range_exp = smax - smin + 1e-12
 
-    # ---1. Eq. (32) in the paper first part of equation---
-    for i in 1:Nstp
-        # 1a. Range of experimental stress for normalization
-        # If all values in σ_exp[i] are the same, maximum - minimum = 0, add small epsilon to avoid division by zero
-        range_exp = maximum(σ_exp[i]) - minimum(σ_exp[i]) + 1e-12
-        # 1b. Normalized difference between simulated and experimental stress
-        # . and the operator ensures element-wise operation
-        normalized_diff=(σ_sim[i].-σ_exp[i])./range_exp
-        # 1c. Accumulate squared difference for this timestep
-        loss_L2+=sum(normalized_diff.^2)
+    # Normalized L2 loss
+    loss_L2 = 0.0
+    for l in 1:Nstp
+        for i in 1:ncomp, j in 1:ncomp
+            d = (Float32(σ_sim[l][i,j]) - Float32(σ_exp[l][i,j])) / (sqrt(Nstp) * Float32(range_exp))
+            loss_L2 += d^2
+        end
     end
 
-    # ---1. Eq. (32) in the paper second part of equation---
-    # [hat{σ}^s_{ij}]_l → simulated stress at timestep l.
-    # [hat{σ}^e_{ij}]_l → experimental stress at timestep l.
-    # l+10 → 10 timesteps ahead (in your code: delta_l).
+    # Sobolev term
+    loss_sobolev = 0.0
     for l in 1:(Nstp - delta_l)
-        # Difference in simulated stress over delta_l steps
-        Δσ_sim=σ_sim[l+delta_l].-σ_sim[l]
-        # Difference in experimental stress over delta_l steps
-        Δσ_exp=σ_exp[l+delta_l].-σ_exp[l]
-        # Normalized differences by experimental stress range at timestep l
-        range_exp=maximum(σ_exp[l])-minimum(σ_exp[l]) + 1e-12
-        Δσ_diff_norm = (Δσ_sim .- Δσ_exp) ./ range_exp
-        # Accumulate squared differences scaled by weighting factor w_g
-        loss_sobolev += w_g * sum(Δσ_diff_norm.^2)
+        for i in 1:ncomp, j in 1:ncomp
+            Δsim = Float32(σ_sim[l+delta_l][i,j]) - Float32(σ_sim[l][i,j])
+            Δexp = Float32(σ_exp[l+delta_l][i,j]) - Float32(σ_exp[l][i,j])
+            d = (Δsim - Δexp) / (sqrt(Nstp) * Float32(range_exp))
+            loss_sobolev += w_g * d^2
+        end
     end
-
-    # --- 3. Average over timesteps ---
-    loss_L2/=Nstp
-    loss_sobolev/=max(1, Nstp-delta_l)  # avoid division by zero
-
-    # --- 4. Total loss ---
-    total_loss=loss_L2+loss_sobolev
-
-    return total_loss
+    tot_loss=loss_L2 + loss_sobolev
+    println("\n=== Loss $tot_loss ===")
+    return tot_loss
 end
 
 
-# 8. Training loop (3D)
+# Lame constants
+λ = (E*ν) / ((1+ν)*(1-2ν))
+μ = E / (2*(1+ν))   # shear modulus
 
-# nt = 100
-# ε_hist_3D = [rand(3,3)*0.01 for i in 1:nt]
-# σ_exp_3D = [rand(3,3)*100 for i in 1:nt]
+# build stiffness tensor C (Voigt 6x6 form)
+C_voigt = [
+    λ+2μ   λ      λ      0     0     0
+    λ     λ+2μ    λ      0     0     0
+    λ      λ     λ+2μ    0     0     0
+    0      0      0      μ     0     0
+    0      0      0      0     μ     0
+    0      0      0      0     0     μ
+]
+
+# helper to convert strain tensor (3x3) to Voigt vector (6x1)
+function tensor_to_voigt(ε::AbstractMatrix{T}) where T<:AbstractFloat
+    return T[
+        ε[1,1];
+        ε[2,2];
+        ε[3,3];
+        2*ε[2,3];
+        2*ε[1,3];
+        2*ε[1,2];
+    ]
+end
+
+# and back: Voigt vector → 3x3 stress tensor
+function voigt_to_tensor(σv::AbstractVector{T}) where T<:AbstractFloat
+    return T[
+        σv[1]  σv[6]/2  σv[5]/2;
+        σv[6]/2 σv[2]   σv[4]/2;
+        σv[5]/2 σv[4]/2 σv[3]
+    ]
+end
+
+# Strain history (uniaxial loading in z-direction) simulates a uniaxial tensile test.
+nt = 30
+ε_hist_3D = [Float32.(Matrix(Diagonal([0.0, 0.0, ε]))) for ε in range(0, 0.02, length=nt)]
+println("\n=== Strain $ε_hist_3D ===")
+# Compute consistent stresses
+C_voigt = Float32.(C_voigt)
+σ_exp_3D = [Float32.(voigt_to_tensor(C_voigt * tensor_to_voigt(ε))) for ε in ε_hist_3D]
+println("\n=== Stress $σ_exp_3D ===")
 
 epochs = 10
 dt = 0.01 #time increment for material simulation.
@@ -259,17 +331,15 @@ optimizer = Flux.setup(RAdam(1e-3), nn)
 
 for step in 1:epochs
     println("\n=== Training step $step ===")
-    #run material simulation using the neural network m
-    #strain history ε_hist_3D
-    #Neural network outputs are used for evolution laws.
-    grads = Flux.gradient((m, ε, σ) -> begin
-        σ_sim = integrate_material_3D(m, ε, dt, G, K, Y0, n_exp, t_star, NN0)
-        #Returns simulated stress σ_sim for all timesteps.
-        loss(σ_sim, σ)
-        #compute the difference between simulation and experimental stress.
-    end, dup_nn, Const(ε_hist_3D), Const(σ_exp_3D))
-    #Gradients tell us how the loss changes if we slightly change each neural network weight.
-    #automatically compute gradients of the loss with respect to neural network parameters.
-
+    
+    grads = Flux.gradient((m, ε, σ) -> 
+        loss_exact_paper(
+            integrate_material_3D(m, ε, dt, G, K, Y0, n_exp, t_star, NN0),
+            σ
+        ), 
+        dup_nn, Const(ε_hist_3D), Const(σ_exp_3D)
+    )
+    
+    # Update original neural network
     Flux.update!(optimizer, nn, grads[1])
 end
