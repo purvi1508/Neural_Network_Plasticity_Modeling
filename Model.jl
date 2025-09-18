@@ -2,17 +2,19 @@ using Flux
 using Enzyme
 using LinearAlgebra
 using Random
+using CSV, DataFrames
+using Statistics
 
 # 1. Material parameters
-E = 210e3 # MPa Young’s modulus
-ν = 0.3 # Poisson’s ratio
-G =  Float32(E/(2*(1+ν))) # Shear Modulus
-K = Float32(E/(3*(1-2*ν))) # Bulk Modulus
-Y0 = Float32(350.0) # MPa Initial stress of the material Y0 comes from a tensile test or compression test.
+# E = 210e3 # MPa Young’s modulus
+# ν = 0.3 # Poisson’s ratio
+G =  Float32(0.05) # Shear Modulus
+K = Float32(0.1) # Bulk Modulus
+Y0 = Float32(0.03) # MPa Initial stress of the material Y0 comes from a tensile test or compression test.
 t_star = Float32(1.0) # _star and n_exp Parameters for viscoplastic flow (flow rate exponent and characteristic time).
 n_exp = 1
 NN0 = Float32(1.0) # Scaling factor for neural network outputs.
-
+#Each step in your strain history is assumed to happen at intervals of dt.
 println("Material parameters: G=$G, K=$K, Y0=$Y0")
 
 # 2. Material state
@@ -170,7 +172,7 @@ function integrate_material_3D(nn, ε_hist_3D, dt, G, K, Y0, n, t_star, NN0)
         println("\n===============================")
         println("🔹 Time step: $i / $nt")
         println("===============================")
-
+        Δt = dt_vals[i]
         # --- Strain history ---
         ε = ε_hist_3D[i]
         println("ε (strain tensor):\n$ε")
@@ -207,9 +209,9 @@ function integrate_material_3D(nn, ε_hist_3D, dt, G, K, Y0, n, t_star, NN0)
         println("κ̇ (hardening variable rate): ", κ_dot)
 
         # --- State updates ---
-        state.β .+= β_dot .* dt
-        state.κ  += κ_dot * dt
-        state.εp .+= λdot .* ν .* dt
+        state.β .+= β_dot .* Δt
+        state.κ  += κ_dot * Δt
+        state.εp .+= λdot .* ν .* Δt
         println("Updated backstress β:\n", state.β)
         println("Updated κ: ", state.κ)
         println("Updated plastic strain εp:\n", state.εp)
@@ -277,69 +279,76 @@ function loss_exact_paper(σ_sim::Vector{<:AbstractMatrix{<:AbstractFloat}},
     return tot_loss
 end
 
+df_strain = CSV.read("strain_readable.csv", DataFrame)
+df_stress = CSV.read("stress_readable.csv", DataFrame)
+sort!(df_strain, [:point, :timestep])
+sort!(df_stress, [:point, :timestep])
 
-# Lame constants
-λ = (E*ν) / ((1+ν)*(1-2ν))
-μ = E / (2*(1+ν))   # shear modulus
+points = unique(df_strain.point)
+timesteps = unique(df_strain.timestep)
+# --- Prepare strain and stress grouped by point ---
+ε_hist_batch = [Vector{Matrix{Float32}}(undef, Nt) for _ in 1:Npt]
+σ_exp_batch  = [Vector{Matrix{Float32}}(undef, Nt) for _ in 1:Npt]
 
-# build stiffness tensor C (Voigt 6x6 form)
-C_voigt = [
-    λ+2μ   λ      λ      0     0     0
-    λ     λ+2μ    λ      0     0     0
-    λ      λ     λ+2μ    0     0     0
-    0      0      0      μ     0     0
-    0      0      0      0     μ     0
-    0      0      0      0     0     μ
-]
+for p in 1:Npt
+    sub_strain = filter(row -> row.point == points[p], df_strain)
+    sub_stress = filter(row -> row.point == points[p], df_stress)
 
-# helper to convert strain tensor (3x3) to Voigt vector (6x1)
-function tensor_to_voigt(ε::AbstractMatrix{T}) where T<:AbstractFloat
-    return T[
-        ε[1,1];
-        ε[2,2];
-        ε[3,3];
-        2*ε[2,3];
-        2*ε[1,3];
-        2*ε[1,2];
-    ]
+    for (k, row) in enumerate(eachrow(sub_strain))
+        ε_hist_batch[p][k] = Float32[
+            row.ε_xx  row.ε_xy  0.0;
+            row.ε_xy  row.ε_yy  0.0;
+            0.0       0.0       0.0
+        ]
+    end
+
+    for (k, row) in enumerate(eachrow(sub_stress))
+        σ_exp_batch[p][k] = Float32[
+            row.σ_xx  row.σ_xy  0.0;
+            row.σ_xy  row.σ_yy  0.0;
+            0.0       0.0       0.0
+        ]
+    end
 end
-
-# and back: Voigt vector → 3x3 stress tensor
-function voigt_to_tensor(σv::AbstractVector{T}) where T<:AbstractFloat
-    return T[
-        σv[1]  σv[6]/2  σv[5]/2;
-        σv[6]/2 σv[2]   σv[4]/2;
-        σv[5]/2 σv[4]/2 σv[3]
-    ]
+# Extract dt values (same for all points)
+dt_vals = zeros(Float32, Nt)
+dt_vals[1] = timesteps[1] / 100
+for k in 2:Nt
+    dt_vals[k] = (timesteps[k] - timesteps[k-1]) / 100
 end
-
-# Strain history (uniaxial loading in z-direction) simulates a uniaxial tensile test.
-nt = 30
-ε_hist_3D = [Float32.(Matrix(Diagonal([0.0, 0.0, ε]))) for ε in range(0, 0.02, length=nt)]
-println("\n=== Strain $ε_hist_3D ===")
-# Compute consistent stresses
-C_voigt = Float32.(C_voigt)
-σ_exp_3D = [Float32.(voigt_to_tensor(C_voigt * tensor_to_voigt(ε))) for ε in ε_hist_3D]
-println("\n=== Stress $σ_exp_3D ===")
+println("Computed dt values: ", dt_vals)
 
 epochs = 10
-dt = 0.01 #time increment for material simulation.
-#Each step in your strain history is assumed to happen at intervals of dt.
-
 optimizer = Flux.setup(RAdam(1e-3), nn)
-#the RAdam optimizer with learning rate 0.001(Since in the paper specific value is not given am using a common value)
+
+loss_history = Float32[]  # <-- array to store loss vs epoch
+epochs = 10
+optimizer = Flux.setup(RAdam(1e-3), nn)
+loss_history = Float32[]
 
 for step in 1:epochs
-    println("\n=== Training step $step ===")
-    
-    grads = Flux.gradient((m, ε, σ) -> 
-        loss_exact_paper(
-            integrate_material_3D(m, ε, dt, G, K, Y0, n_exp, t_star, NN0),
-            σ
-        ), 
-        dup_nn, Const(ε_hist_3D), Const(σ_exp_3D)
-    )
-    
-    # Update original neural network
-    Flux.update!(optimizer, nn, grads[1])
+    grads, loss_total_epoch = Flux.gradient(dup_nn) do nn_model
+        loss_total = 0.0
+        for p in 1:Npt
+            ε_hist_3D = ε_hist_batch[p]   # strain history for point p
+            σ_exp_3D  = σ_exp_batch[p]    # experimental stress history for point p
+
+            σ_sim = integrate_material_3D(
+                nn_model, ε_hist_3D, dt_vals, G, K, Y0, n_exp, t_star, NN0
+            )
+
+            loss_total += loss_exact_paper(σ_sim, σ_exp_3D)
+        end
+        loss_total / Npt
+    end
+
+    Flux.update!(optimizer, nn, grads)
+
+    push!(loss_history, loss_total_epoch)
+    println("Epoch $step, Loss = $(loss_total_epoch)")
 end
+# Save loss_history to CSV for plotting
+using CSV, DataFrames
+df_loss = DataFrame(epoch = 1:epochs, loss = loss_history)
+CSV.write("loss_vs_epoch.csv", df_loss)
+
