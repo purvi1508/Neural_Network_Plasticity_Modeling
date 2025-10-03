@@ -95,24 +95,52 @@ for i = 1:NT
     velo[:,i+1] = ∂u
 end
 
-# ===== Save stress and strain in readable CSV format =====
-open("stress_readable.csv", "w") do io
-    writedlm(io, [["timestep", "point", "σ_xx", "σ_yy", "σ_xy"]])
-    for i = 1:NT+1
-        for j = 1:4*m*n
-            row = [i, j, stress[i, j, 1], stress[i, j, 2], stress[i, j, 3]]
-            writedlm(io, [row])
-        end
-    end
-end
+# ===== Save stress and strain for alpha > 0 =====
+# open("stress_readable.csv", "w") do io
+#     writedlm(io, [["timestep", "point", "σ_xx", "σ_yy", "σ_xy", "λ"]])
+#     for i = 1:NT+1
+#         for j = 1:4*m*n
+#             row = [i, j, stress[i, j, 1], stress[i, j, 2], stress[i, j, 3], internal_variable[i, j]]
+#             writedlm(io, [row])
+#         end
+#     end
+# end
 
-open("strain_readable.csv", "w") do io
-    writedlm(io, [["timestep", "point", "ε_xx", "ε_yy", "ε_xy"]])
+# open("strain_readable.csv", "w") do io
+#     writedlm(io, [["timestep", "point", "ε_xx", "ε_yy", "ε_xy", "λ"]])
+#     for i = 1:NT+1
+#         ε_i = eval_strain_on_gauss_pts(state[:, i], m, n, h)
+#         for j = 1:4*m*n
+#             row = [i, j, ε_i[j, 1], ε_i[j, 2], ε_i[j, 3], internal_variable[i, j]]
+#             writedlm(io, [row])
+#         end
+#     end
+# end
+
+open("stress_strain_readable.csv", "w") do io
+    # header
+    writedlm(io, [["timestep","point","σ_xx","σ_yy","σ_xy","ε_xx","ε_yy","ε_xy","λ"]], ',')
+
     for i = 1:NT+1
         ε_i = eval_strain_on_gauss_pts(state[:, i], m, n, h)
+
         for j = 1:4*m*n
-            row = [i, j, ε_i[j, 1], ε_i[j, 2], ε_i[j, 3]]
-            writedlm(io, [row])
+            λ_curr = internal_variable[i, j]
+            λ_prev = (i == 1) ? 0.0 : internal_variable[i-1, j]
+            λ = λ_curr - λ_prev   # incremental plastic multiplier
+
+            row = [
+                i,                                # timestep
+                j,                                # point index
+                stress[i, j, 1],                  # σ_xx
+                stress[i, j, 2],                  # σ_yy
+                stress[i, j, 3],                  # σ_xy
+                ε_i[j, 1],                        # ε_xx
+                ε_i[j, 2],                        # ε_yy
+                ε_i[j, 3],                        # ε_xy
+                λ                                # save incremental λ
+            ]
+            writedlm(io, [row], ',')
         end
     end
 end
